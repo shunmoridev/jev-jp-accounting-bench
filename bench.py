@@ -365,48 +365,50 @@ def evaluate_cases(
 
     results: list[dict[str, Any] | None] = [None] * len(cases)
 
-    def run_one(index: int, case: Case) -> tuple[int, dict[str, Any]]:
-        with httpx.Client() as http:
-            try:
-                return index, client.evaluate(http, case)
-            except Exception as exc:
-                return index, {
-                    "item_id": case.item_id,
-                    "benchmark": case.benchmark,
-                    "protocol": case.protocol,
-                    "predicted": None,
-                    "gold": case.gold_label,
-                    "correct": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "meta": case.meta,
-                }
-
-    if workers <= 1:
-        for i, case in enumerate(cases):
-            _, result = run_one(i, case)
-            results[i] = result
-            status = "OK" if "error" not in result else "ERR"
-            print(
-                f"[{i + 1:>4}/{len(cases)}] {status} "
-                f"{case.item_id}: {result.get('predicted')} / {case.gold_label}"
-            )
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(run_one, i, case): (i, case)
-                for i, case in enumerate(cases)
+    def run_one(
+        http: httpx.Client, index: int, case: Case
+    ) -> tuple[int, dict[str, Any]]:
+        try:
+            return index, client.evaluate(http, case)
+        except Exception as exc:
+            return index, {
+                "item_id": case.item_id,
+                "benchmark": case.benchmark,
+                "protocol": case.protocol,
+                "predicted": None,
+                "gold": case.gold_label,
+                "correct": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "meta": case.meta,
             }
-            completed = 0
-            for future in as_completed(futures):
-                index, case = futures[future]
-                _, result = future.result()
-                results[index] = result
-                completed += 1
+
+    with httpx.Client() as http:
+        if workers <= 1:
+            for i, case in enumerate(cases):
+                _, result = run_one(http, i, case)
+                results[i] = result
                 status = "OK" if "error" not in result else "ERR"
                 print(
-                    f"[{completed:>4}/{len(cases)}] {status} "
+                    f"[{i + 1:>4}/{len(cases)}] {status} "
                     f"{case.item_id}: {result.get('predicted')} / {case.gold_label}"
                 )
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(run_one, http, i, case): (i, case)
+                    for i, case in enumerate(cases)
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    index, case = futures[future]
+                    _, result = future.result()
+                    results[index] = result
+                    completed += 1
+                    status = "OK" if "error" not in result else "ERR"
+                    print(
+                        f"[{completed:>4}/{len(cases)}] {status} "
+                        f"{case.item_id}: {result.get('predicted')} / {case.gold_label}"
+                    )
 
     return [result for result in results if result is not None]
 

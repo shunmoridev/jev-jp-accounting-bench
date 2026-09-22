@@ -29,7 +29,7 @@ DEFAULT_MODEL = "jev-latest"
 LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 _NUM_RE = re.compile(
-    r"(?P<num>[+-]?(?:\\d{1,3}(?:,\\d{3})+|\\d+)(?:\\.\\d+)?)"
+    r"(?P<num>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
 )
 
 

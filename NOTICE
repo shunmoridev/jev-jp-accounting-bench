@@ -1,0 +1,5 @@
+jev-jp-accounting-bench
+Copyright 2026 shunmoridev
+
+This repository does not include the JMMLU or jfinqa benchmark datasets.
+See THIRD_PARTY.md for upstream dataset attribution and licensing.

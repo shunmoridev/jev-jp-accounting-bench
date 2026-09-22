@@ -77,7 +77,14 @@ python bench.py jfinqa --subtask numerical_reasoning --limit 50 --seed 42
 python bench.py all --output results/run.json
 python bench.py jmmlu --dry-run --limit 3
 python bench.py all --base-url http://127.0.0.1:8000 --model openjev-latest
+python bench.py jmmlu --log logs/my-run.jsonl   # custom request/response trace path
+python bench.py jmmlu --no-log                  # disable request/response logging
+python bench.py jmmlu --batch-size 4            # pack 4 items into one request (q1..q4)
 ```
+
+`--batch-size N` concatenates N items into a single `state` (delimited by `【項目k】`) and asks `q1`..`qN` in one call, cutting the number of HTTP requests by N. This changes the model input, so batched accuracy is not directly comparable with `--batch-size 1` runs; `batch_size` is recorded per result in `meta` and in the top-level result JSON.
+
+`--group-context` (jfinqa) is semantic aggregation instead of concatenation: jfinqa questions sharing the same evidence (same rendered context / `source_doc_id`) are grouped, the shared `資料` is sent once as `state`, and each question text is embedded in its own question's `instructions` as `質問: ...`. `--group-max` caps questions per request (default 10). JMMLU items have no shared context and remain singleton requests.
 
 Use `python bench.py --help` for the complete CLI.
 
@@ -96,6 +103,8 @@ This protocol measures **financial answer selection**, not canonical free-form j
 ## Results
 
 By default results are written under `results/`. Result JSON contains benchmark metadata and per-item labels/probabilities, but intentionally does **not** copy the upstream question text or tables.
+
+Raw request/response bodies (including the full `state` sent to the endpoint) are written to a JSONL trace under `logs/` for local debugging. Both `results/` and `logs/` are git-ignored; do not publish trace logs, since they contain dataset text.
 
 Example summary:
 

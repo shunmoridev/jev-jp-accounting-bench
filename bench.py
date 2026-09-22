@@ -8,7 +8,9 @@ import json
 import os
 import random
 import re
+import statistics
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +45,8 @@ class Case:
     criteria: dict[str, str]
     gold_label: str
     meta: dict[str, Any]
+    context: str = ""
+    question: str | None = None
 
 
 def stable_rng(seed: int, item_id: str) -> random.Random:
@@ -91,6 +95,7 @@ def load_jmmlu(cache_dir: Path, limit: int | None) -> list[Case]:
                     criteria={"A": a, "B": b, "C": c, "D": d},
                     gold_label=gold,
                     meta={"row": index},
+                    context=question,
                 )
             )
             if limit is not None and len(cases) >= limit:
@@ -262,6 +267,8 @@ def load_jfinqa_cases(
                 protocol="answer_selection_v1",
                 item_id=q.id,
                 state=state,
+                context="資料:\n" + context if context else "",
+                question=q.qa.question,
                 instructions=(
                     "資料と質問に基づいて正しい回答候補を1つ選んでください。"
                     "criteria の各ラベルには回答候補が入っています。"
@@ -286,24 +293,56 @@ class JevClient:
         api_key: str | None,
         model: str,
         timeout: float,
+        independent_items: bool = False,
+        group_context: bool = False,
     ) -> None:
         self.url = base_url.rstrip("/") + "/v1/systemone"
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
+        self.independent_items = independent_items
+        self.group_context = group_context
 
-    def evaluate(self, http: httpx.Client, case: Case) -> dict[str, Any]:
-        payload = {
-            "model": self.model,
-            "state": case.state,
-            "questions": {
-                "answer": {
-                    "type": "choice",
-                    "instructions": case.instructions,
-                    "criteria": case.criteria,
-                }
-            },
-        }
+    def evaluate_batch(
+        self, http: httpx.Client, cases: list[Case], trace: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        single = len(cases) == 1
+        independence_note = (
+            "各項目は互いに独立した問題です。他の項目の内容・選択を参照しないでください。"
+            if self.independent_items and not single
+            else ""
+        )
+
+        if self.group_context:
+            # Shared evidence goes to `state` once; each question text lives in
+            # its own question's instructions (semantic aggregation).
+            state = cases[0].context or cases[0].state
+        elif single:
+            state = cases[0].state
+        else:
+            state = "\n\n".join(
+                f"【項目{k}】\n{case.state}" for k, case in enumerate(cases, start=1)
+            )
+
+        questions: dict[str, dict[str, Any]] = {}
+        qkeys: list[str] = []
+        for k, case in enumerate(cases, start=1):
+            qkey = "answer" if single else f"q{k}"
+            instructions = independence_note
+            if not single and not self.group_context:
+                instructions += f"この設問は state 内の【項目{k}】に対応します。"
+            instructions += case.instructions
+            if self.group_context and case.question:
+                instructions += f"\n質問: {case.question}"
+            questions[qkey] = {
+                "type": "choice",
+                "instructions": instructions,
+                "criteria": case.criteria,
+            }
+            qkeys.append(qkey)
+
+        payload = {"model": self.model, "state": state, "questions": questions}
+        trace["request"] = {"url": self.url, "payload": payload}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -316,42 +355,54 @@ class JevClient:
             timeout=self.timeout,
         )
         latency_ms = (time.perf_counter() - start) * 1000.0
+        trace["status"] = response.status_code
+        trace["latency_ms"] = round(latency_ms, 2)
+        if response.is_error:
+            trace["response_text"] = response.text[:4000]
         response.raise_for_status()
         body = response.json()
+        trace["response"] = body
 
-        answer = body.get("answers", {}).get("answer")
-        if not isinstance(answer, dict):
-            raise ValueError(
-                f"Malformed System One response for {case.item_id}: missing answers.answer"
+        answers = body.get("answers", {})
+        results: list[dict[str, Any]] = []
+        for case, qkey in zip(cases, qkeys):
+            answer = answers.get(qkey)
+            if not isinstance(answer, dict):
+                raise ValueError(
+                    f"Malformed System One response for {case.item_id}: "
+                    f"missing answers.{qkey}"
+                )
+
+            predicted = answer.get("choice")
+            if predicted not in case.criteria:
+                raise ValueError(
+                    f"Malformed choice for {case.item_id}: {predicted!r}; "
+                    f"expected one of {list(case.criteria)}"
+                )
+
+            probabilities = answer.get("probabilities")
+            confidence = answer.get("confidence")
+            if confidence is None and isinstance(probabilities, dict):
+                try:
+                    confidence = float(probabilities[predicted])
+                except (KeyError, TypeError, ValueError):
+                    confidence = None
+
+            results.append(
+                {
+                    "item_id": case.item_id,
+                    "benchmark": case.benchmark,
+                    "protocol": case.protocol,
+                    "predicted": predicted,
+                    "gold": case.gold_label,
+                    "correct": predicted == case.gold_label,
+                    "confidence": confidence,
+                    "probabilities": probabilities,
+                    "latency_ms": round(latency_ms, 2),
+                    "meta": {**case.meta, "batch_size": len(cases)},
+                }
             )
-
-        predicted = answer.get("choice")
-        if predicted not in case.criteria:
-            raise ValueError(
-                f"Malformed choice for {case.item_id}: {predicted!r}; "
-                f"expected one of {list(case.criteria)}"
-            )
-
-        probabilities = answer.get("probabilities")
-        confidence = answer.get("confidence")
-        if confidence is None and isinstance(probabilities, dict):
-            try:
-                confidence = float(probabilities[predicted])
-            except (KeyError, TypeError, ValueError):
-                confidence = None
-
-        return {
-            "item_id": case.item_id,
-            "benchmark": case.benchmark,
-            "protocol": case.protocol,
-            "predicted": predicted,
-            "gold": case.gold_label,
-            "correct": predicted == case.gold_label,
-            "confidence": confidence,
-            "probabilities": probabilities,
-            "latency_ms": round(latency_ms, 2),
-            "meta": case.meta,
-        }
+        return results
 
 
 def evaluate_cases(
@@ -359,58 +410,136 @@ def evaluate_cases(
     cases: list[Case],
     client: JevClient,
     workers: int,
+    batch_size: int = 1,
+    group_context: bool = False,
+    group_max: int = 10,
+    log_file: Any | None = None,
 ) -> list[dict[str, Any]]:
     if not cases:
         return []
 
-    results: list[dict[str, Any] | None] = [None] * len(cases)
+    indexed: list[tuple[int, Case]] = list(enumerate(cases))
+    if group_context:
+        groups: dict[str, list[tuple[int, Case]]] = {}
+        for pair in indexed:
+            groups.setdefault(pair[1].context or pair[1].state, []).append(pair)
+        batches: list[list[tuple[int, Case]]] = []
+        for members in groups.values():
+            for i in range(0, len(members), group_max):
+                batches.append(members[i : i + group_max])
+    else:
+        batches = [
+            indexed[start : start + batch_size]
+            for start in range(0, len(cases), batch_size)
+        ]
 
-    def run_one(
-        http: httpx.Client, index: int, case: Case
-    ) -> tuple[int, dict[str, Any]]:
+    results: list[dict[str, Any] | None] = [None] * len(cases)
+    log_lock = threading.Lock()
+
+    def write_trace(trace: dict[str, Any]) -> None:
+        if log_file is None:
+            return
+        with log_lock:
+            log_file.write(json.dumps(trace, ensure_ascii=False) + "\n")
+            log_file.flush()
+
+    def run_batch(
+        http: httpx.Client, batch: list[tuple[int, Case]]
+    ) -> tuple[list[tuple[int, Case]], list[dict[str, Any]], dict[str, Any]]:
+        batch_cases = [case for _, case in batch]
+        trace: dict[str, Any] = {"item_ids": [case.item_id for case in batch_cases]}
         try:
-            return index, client.evaluate(http, case)
+            return batch, client.evaluate_batch(http, batch_cases, trace), trace
         except Exception as exc:
-            return index, {
-                "item_id": case.item_id,
-                "benchmark": case.benchmark,
-                "protocol": case.protocol,
-                "predicted": None,
-                "gold": case.gold_label,
-                "correct": False,
-                "error": f"{type(exc).__name__}: {exc}",
-                "meta": case.meta,
-            }
+            trace["error"] = f"{type(exc).__name__}: {exc}"
+            return batch, [
+                {
+                    "item_id": case.item_id,
+                    "benchmark": case.benchmark,
+                    "protocol": case.protocol,
+                    "predicted": None,
+                    "gold": case.gold_label,
+                    "correct": False,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "meta": {**case.meta, "batch_size": len(batch_cases)},
+                }
+                for _, case in batch
+            ], trace
+
+    completed = 0
+
+    def report(batch: list[tuple[int, Case]], rows: list[dict[str, Any]]) -> None:
+        nonlocal completed
+        for (index, _), result in zip(batch, rows):
+            results[index] = result
+            completed += 1
+            status = "OK" if "error" not in result else "ERR"
+            print(
+                f"[{completed:>4}/{len(cases)}] {status} "
+                f"{result['item_id']}: {result.get('predicted')} / {result['gold']}"
+            )
 
     with httpx.Client() as http:
         if workers <= 1:
-            for i, case in enumerate(cases):
-                _, result = run_one(http, i, case)
-                results[i] = result
-                status = "OK" if "error" not in result else "ERR"
-                print(
-                    f"[{i + 1:>4}/{len(cases)}] {status} "
-                    f"{case.item_id}: {result.get('predicted')} / {case.gold_label}"
-                )
+            for batch in batches:
+                _, rows, trace = run_batch(http, batch)
+                write_trace(trace)
+                report(batch, rows)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {
-                    pool.submit(run_one, http, i, case): (i, case)
-                    for i, case in enumerate(cases)
+                    pool.submit(run_batch, http, batch): batch for batch in batches
                 }
-                completed = 0
                 for future in as_completed(futures):
-                    index, case = futures[future]
-                    _, result = future.result()
-                    results[index] = result
-                    completed += 1
-                    status = "OK" if "error" not in result else "ERR"
-                    print(
-                        f"[{completed:>4}/{len(cases)}] {status} "
-                        f"{case.item_id}: {result.get('predicted')} / {case.gold_label}"
-                    )
+                    batch = futures[future]
+                    _, rows, trace = future.result()
+                    write_trace(trace)
+                    report(batch, rows)
 
     return [result for result in results if result is not None]
+
+
+def _prob_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    probs = [
+        float(row["confidence"])
+        for row in rows
+        if row.get("confidence") is not None
+    ]
+    if not probs:
+        return {"median": None, "std": None, "n": 0}
+    return {
+        "median": round(statistics.median(probs), 4),
+        "std": round(statistics.pstdev(probs), 4),
+        "n": len(probs),
+    }
+
+
+def _latency_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    values = sorted(
+        float(row["latency_ms"])
+        for row in rows
+        if row.get("latency_ms") is not None
+    )
+    stats: dict[str, Any] = {
+        "mean": None,
+        "median": None,
+        "p95": None,
+        "min": None,
+        "max": None,
+    }
+    if not values:
+        return stats
+    stats["mean"] = round(statistics.fmean(values), 2)
+    stats["median"] = round(statistics.median(values), 2)
+    stats["p95"] = round(
+        statistics.quantiles(values, n=100, method="inclusive")[94]
+        if len(values) >= 2
+        else values[0],
+        2,
+    )
+    stats["min"] = round(values[0], 2)
+    stats["max"] = round(values[-1], 2)
+    return stats
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -421,15 +550,11 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     summary: dict[str, Any] = {}
     for (benchmark, protocol), rows in groups.items():
         successful = [row for row in rows if "error" not in row]
-        correct = sum(bool(row["correct"]) for row in successful)
+        correct_rows = [row for row in successful if row["correct"]]
+        incorrect_rows = [row for row in successful if not row["correct"]]
+        correct = len(correct_rows)
         errors = len(rows) - len(successful)
         accuracy = correct / len(successful) if successful else 0.0
-        latencies = [
-            float(row["latency_ms"])
-            for row in successful
-            if row.get("latency_ms") is not None
-        ]
-        avg_latency = sum(latencies) / len(latencies) if latencies else None
         key = f"{benchmark}:{protocol}"
         summary[key] = {
             "benchmark": benchmark,
@@ -439,20 +564,41 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
             "correct": correct,
             "errors": errors,
             "accuracy": accuracy,
-            "avg_latency_ms": round(avg_latency, 2) if avg_latency is not None else None,
+            "latency_ms": _latency_stats(successful),
+            "selected_prob_when_correct": _prob_stats(correct_rows),
+            "selected_prob_when_incorrect": _prob_stats(incorrect_rows),
         }
     return summary
 
 
-def print_summary(summary: dict[str, Any]) -> None:
+def print_summary(
+    summary: dict[str, Any], *, total_seconds: float, workers: int
+) -> None:
     print("\nResults")
     print("=" * 72)
     for row in summary.values():
+        latency = row["latency_ms"]
+        latency_str = (
+            f"mean={latency['mean']} p95={latency['p95']} ms"
+            if latency["mean"] is not None
+            else "n/a"
+        )
         print(
             f"{row['benchmark']} [{row['protocol']}]: "
             f"{row['correct']}/{row['evaluated']} = {row['accuracy']:.2%} "
-            f"(errors={row['errors']}, avg={row['avg_latency_ms']} ms)"
+            f"(errors={row['errors']}, latency {latency_str})"
         )
+        for key, label in (
+            ("selected_prob_when_correct", "correct"),
+            ("selected_prob_when_incorrect", "incorrect"),
+        ):
+            stats = row[key]
+            if stats["n"]:
+                print(
+                    f"    chosen-prob {label}: median={stats['median']:.4f} "
+                    f"std={stats['std']:.4f} (n={stats['n']})"
+                )
+    print(f"total={total_seconds:.2f}s workers={workers}")
 
 
 def dry_run(cases: list[Case]) -> None:
@@ -512,6 +658,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Concurrent requests. Start with 1; increase if your endpoint permits it.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Items per request. >1 packs N items into one state with questions q1..qN.",
+    )
+    parser.add_argument(
+        "--independent-items",
+        action="store_true",
+        help="Tell the model batched items are independent (only affects --batch-size > 1).",
+    )
+    parser.add_argument(
+        "--group-context",
+        action="store_true",
+        help=(
+            "Semantic aggregation: share each jfinqa context once in state and "
+            "put each question text into its own question's instructions. "
+            "Overrides --batch-size."
+        ),
+    )
+    parser.add_argument(
+        "--group-max",
+        type=int,
+        default=10,
+        help="Max questions per shared-context request (with --group-context).",
+    )
+    parser.add_argument(
         "--cache-dir",
         type=Path,
         default=Path(".cache"),
@@ -521,7 +693,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Result JSON path. Default: results/<timestamp>.json",
+        help="Result JSON path. Default: results/<timestamp>-w<workers>-b<batch>.json",
+    )
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help="Request/response JSONL log path. Default: logs/<timestamp>-w<workers>-b<batch>.jsonl",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Disable request/response logging.",
     )
     parser.add_argument(
         "--dry-run",
@@ -538,6 +721,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--limit must be > 0")
     if args.workers <= 0:
         raise SystemExit("--workers must be > 0")
+    if args.batch_size <= 0:
+        raise SystemExit("--batch-size must be > 0")
+    if args.group_max <= 0:
+        raise SystemExit("--group-max must be > 0")
     if args.subtask and args.benchmark == "jmmlu":
         raise SystemExit("--subtask only applies to jfinqa")
 
@@ -557,18 +744,49 @@ def main(argv: list[str] | None = None) -> int:
         dry_run(cases)
         return 0
 
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    log_file = None
+    log_path = None
+    if not args.no_log:
+        log_path = args.log or Path("logs") / (
+            f"jev-trace-{timestamp}-w{args.workers}-b{args.batch_size}.jsonl"
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("w", encoding="utf-8")
+
     client = JevClient(
         base_url=args.base_url,
         api_key=args.api_key,
         model=args.model,
         timeout=args.timeout,
+        independent_items=args.independent_items,
+        group_context=args.group_context,
     )
-    results = evaluate_cases(cases=cases, client=client, workers=args.workers)
-    summary = summarize(results)
-    print_summary(summary)
+    eval_start = time.perf_counter()
+    try:
+        results = evaluate_cases(
+            cases=cases,
+            client=client,
+            workers=args.workers,
+            batch_size=args.batch_size,
+            group_context=args.group_context,
+            group_max=args.group_max,
+            log_file=log_file,
+        )
+    finally:
+        total_seconds = time.perf_counter() - eval_start
+        if log_file is not None:
+            log_file.close()
+    if log_path is not None:
+        print(f"Wrote {log_path}")
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = args.output or Path("results") / f"jev-accounting-{timestamp}.json"
+    summary = summarize(results)
+    print_summary(summary, total_seconds=total_seconds, workers=args.workers)
+
+    output = args.output or Path("results") / (
+        f"jev-accounting-{timestamp}-w{args.workers}-b{args.batch_size}.json"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
 
     payload = {
@@ -579,6 +797,12 @@ def main(argv: list[str] | None = None) -> int:
         "seed": args.seed,
         "benchmark": args.benchmark,
         "subtask": args.subtask,
+        "workers": args.workers,
+        "batch_size": args.batch_size,
+        "group_context": args.group_context,
+        "group_max": args.group_max,
+        "independent_items": args.independent_items,
+        "total_time_s": round(total_seconds, 2),
         "summary": summary,
         "results": results,
         "notes": {
